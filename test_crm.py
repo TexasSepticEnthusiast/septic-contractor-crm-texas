@@ -1,21 +1,24 @@
 """Tests for the crm.py module. Uses a temp file for the store."""
+import contextlib
+import io
 import json
 import tempfile
 import unittest
 from pathlib import Path
+from datetime import datetime, timezone
+from unittest.mock import patch
 
 import crm
 
 
 class TestStore(unittest.TestCase):
     def setUp(self):
-        self.tmp = tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False)
-        self.tmp.close()
-        self.path = Path(self.tmp.name)
+        self.tmp = tempfile.TemporaryDirectory()
+        self.path = Path(self.tmp.name) / "customers.json"
         self.store = crm.Store(self.path)
 
     def tearDown(self):
-        self.path.unlink(missing_ok=True)
+        self.tmp.cleanup()
 
     def _make(self, name="Test", phone="940-555-0001", **kw):
         return crm.Customer(
@@ -34,12 +37,90 @@ class TestStore(unittest.TestCase):
         self.assertEqual(s2.find("abc-123").name, "Alice")
 
     def test_update_status(self):
-        c = crm.Customer(id="id-001", name="Bob", phone="940-555-0002")
-        self.store.add(c)
-        updated = self.store.update("id-001", status="quoted", notes="sent estimate")
+        created = datetime(2026, 10, 17, 12, 0, 0, 100000, tzinfo=timezone.utc)
+        edited = created.replace(microsecond=200000)
+        with patch("crm.datetime", wraps=datetime) as clock:
+            clock.now.return_value = created
+            c = crm.Customer(id="id-001", name="Bob", phone="940-555-0002")
+            self.store.add(c)
+            before = c.updated_at
+            clock.now.return_value = edited
+            updated = self.store.update("id-001", status="quoted", notes="sent estimate")
+        self.assertIs(updated, c)  # Store updates a Customer in place.
         self.assertEqual(updated.status, "quoted")
         self.assertEqual(updated.notes, "sent estimate")
-        self.assertNotEqual(updated.updated_at, c.updated_at)
+        self.assertEqual(before, created.isoformat(timespec="microseconds"))
+        self.assertEqual(updated.updated_at, edited.isoformat(timespec="microseconds"))
+        self.assertNotEqual(updated.updated_at, before)
+        self.assertEqual(updated.created_at, before)
+        reloaded = crm.Store(self.path).find("id-001")
+        self.assertEqual(reloaded.updated_at, updated.updated_at)
+        self.assertEqual(reloaded.status, "quoted")
+        self.assertEqual(reloaded.notes, "sent estimate")
+
+    def test_legacy_second_precision_timestamp_can_be_updated(self):
+        legacy = "2026-10-17T12:00:00+00:00"
+        self.store.add(crm.Customer(id="legacy", name="Test", phone="1",
+                                    created_at=legacy, updated_at=legacy))
+        self.store = crm.Store(self.path)
+        edited = datetime(2026, 10, 17, 12, 0, 0, 500000, tzinfo=timezone.utc)
+        with patch("crm.datetime", wraps=datetime) as clock:
+            clock.now.return_value = edited
+            updated = self.store.update("legacy", notes="Updated within same second")
+        self.assertEqual(updated.created_at, legacy)
+        self.assertEqual(updated.updated_at, edited.isoformat(timespec="microseconds"))
+        self.assertEqual(crm.Store(self.path).find("legacy").updated_at, updated.updated_at)
+
+    def test_update_missing_customer_does_not_write(self):
+        self.store.add(crm.Customer(id="exists", name="Test", phone="1"))
+        before = self.path.read_bytes()
+        self.assertIsNone(self.store.update("missing", status="quoted"))
+        self.assertEqual(self.path.read_bytes(), before)
+
+    def test_ambiguous_prefix_never_mutates_a_record(self):
+        self.store.add(crm.Customer(id="abc-123", name="A", phone="1"))
+        self.store.add(crm.Customer(id="abc-456", name="B", phone="2"))
+        before = self.path.read_bytes()
+        for action in (lambda: self.store.find("abc"),
+                       lambda: self.store.update("abc", status="done"),
+                       lambda: self.store.delete("abc")):
+            with self.assertRaisesRegex(crm.StoreError, "ambiguous"):
+                action()
+            self.assertEqual(self.path.read_bytes(), before)
+        self.assertEqual([c.status for c in self.store.customers], ["lead", "lead"])
+
+    def test_exact_id_wins_over_other_prefix_matches(self):
+        self.store.add(crm.Customer(id="abc-long", name="Long", phone="1"))
+        self.store.add(crm.Customer(id="abc", name="Exact", phone="2"))
+        self.assertEqual(self.store.find("abc").name, "Exact")
+        self.assertEqual(self.store.find("abc-l").name, "Long")
+        with self.assertRaisesRegex(crm.StoreError, "empty"):
+            self.store.find("")
+
+    def test_corrupt_store_add_fails_without_overwriting_bytes(self):
+        record = {"id": "test", "name": "Test", "phone": "1"}
+        invalid = (b"", b"{broken", b"\xff", b"[]", b"{}", b'{"customers": {}}',
+                   b'{"customers": [null]}', b'{"customers": [{}]}',
+                   json.dumps({"customers": [dict(record, phone=123)]}).encode(),
+                   json.dumps({"customers": [dict(record, extra="unsupported")]}).encode(),
+                   json.dumps({"customers": [record, record]}).encode())
+        for content in invalid:
+            with self.subTest(content=content):
+                self.path.write_bytes(content)
+                with contextlib.redirect_stderr(io.StringIO()) as err:
+                    code = crm.main(["--store", str(self.path), "add", "Test", "1"])
+                self.assertEqual(code, 2)
+                self.assertIn("no changes written", err.getvalue())
+                self.assertEqual(self.path.read_bytes(), content)
+
+    def test_cli_ambiguous_delete_is_a_clear_error(self):
+        self.store.add(crm.Customer(id="abc-123", name="A", phone="1"))
+        self.store.add(crm.Customer(id="abc-456", name="B", phone="2"))
+        before = self.path.read_bytes()
+        with contextlib.redirect_stderr(io.StringIO()) as err:
+            self.assertEqual(crm.main(["--store", str(self.path), "delete", "abc"]), 2)
+        self.assertIn("use the full ID", err.getvalue())
+        self.assertEqual(self.path.read_bytes(), before)
 
     def test_delete(self):
         c = crm.Customer(id="id-del", name="Del", phone="940-555-0003")
@@ -73,12 +154,11 @@ class TestStore(unittest.TestCase):
 
 class TestCLISmoke(unittest.TestCase):
     def setUp(self):
-        self.tmp = tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False)
-        self.tmp.close()
-        self.path = Path(self.tmp.name)
+        self.tmp = tempfile.TemporaryDirectory()
+        self.path = Path(self.tmp.name) / "customers.json"
 
     def tearDown(self):
-        self.path.unlink(missing_ok=True)
+        self.tmp.cleanup()
 
     def test_add_then_list(self):
         crm.main(["--store", str(self.path), "add", "Test User", "940-555-0100", "--county", "Palo Pinto", "--service", "perc test"])

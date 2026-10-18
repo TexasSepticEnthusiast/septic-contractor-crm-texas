@@ -40,7 +40,7 @@ VALID_STATUSES = ["lead", "contacted", "quoted", "hired", "done", "lost"]
 
 
 @dataclass
-class Customer:
+class OutWestSepticCustomer:
     id: str
     name: str
     phone: str
@@ -50,16 +50,20 @@ class Customer:
     service: str = ""
     status: str = "lead"
     notes: str = ""
-    created_at: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat(timespec="seconds"))
-    updated_at: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat(timespec="seconds"))
+    created_at: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat(timespec="microseconds"))
+    updated_at: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat(timespec="microseconds"))
 
 
 # ---------- store ----------
 
-class Store:
+class OutWestSepticCRMError(ValueError):
+    """A store or identifier problem that must not silently change customer data."""
+
+
+class OutWestSepticCRMStore:
     def __init__(self, path: Path):
         self.path = path
-        self.customers: list[Customer] = []
+        self.customers: list[OutWestSepticCustomer] = []
         self.load()
 
     def load(self) -> None:
@@ -67,34 +71,53 @@ class Store:
             return
         try:
             data = json.loads(self.path.read_text(encoding="utf-8"))
-        except json.JSONDecodeError as e:
-            print(f"warning: store file is corrupt: {e}", file=sys.stderr)
-            return
-        self.customers = [Customer(**c) for c in data.get("customers", [])]
+            if not isinstance(data, dict) or not isinstance(data.get("customers"), list):
+                raise ValueError("expected an object containing a customers list")
+            loaded = []
+            ids = set()
+            for row in data["customers"]:
+                if not isinstance(row, dict):
+                    raise ValueError("each customer must be an object")
+                customer = OutWestSepticCustomer(**row)
+                if not all(isinstance(value, str) for value in asdict(customer).values()):
+                    raise ValueError("customer fields must be strings")
+                if not customer.id or customer.id in ids:
+                    raise ValueError("customer IDs must be nonempty and unique")
+                ids.add(customer.id)
+                loaded.append(customer)
+        except (ValueError, TypeError, UnicodeError) as exc:
+            # Do not expose customer contents or pretend an unreadable store is empty.
+            raise OutWestSepticCRMError("cannot load CRM store: invalid JSON or customer structure; no changes written") from exc
+        self.customers = loaded
 
     def save(self) -> None:
-        data = {"customers": [asdict(c) for c in self.customers], "saved_at": datetime.now(timezone.utc).isoformat(timespec="seconds")}
+        data = {"customers": [asdict(c) for c in self.customers], "saved_at": datetime.now(timezone.utc).isoformat(timespec="microseconds")}
         self.path.write_text(json.dumps(data, indent=2), encoding="utf-8")
 
-    def add(self, c: Customer) -> Customer:
+    def add(self, c: OutWestSepticCustomer) -> OutWestSepticCustomer:
         self.customers.append(c)
         self.save()
         return c
 
-    def find(self, id_or_prefix: str) -> Customer | None:
-        for c in self.customers:
-            if c.id == id_or_prefix or c.id.startswith(id_or_prefix):
-                return c
-        return None
+    def find(self, id_or_prefix: str) -> OutWestSepticCustomer | None:
+        if not id_or_prefix:
+            raise OutWestSepticCRMError("customer ID or prefix must not be empty")
+        exact = next((c for c in self.customers if c.id == id_or_prefix), None)
+        if exact is not None:
+            return exact
+        matches = [c for c in self.customers if c.id.startswith(id_or_prefix)]
+        if len(matches) > 1:
+            raise OutWestSepticCRMError("ambiguous customer ID prefix; use the full ID")
+        return matches[0] if matches else None
 
-    def update(self, id_or_prefix: str, **fields: Any) -> Customer | None:
+    def update(self, id_or_prefix: str, **fields: Any) -> OutWestSepticCustomer | None:
         c = self.find(id_or_prefix)
         if not c:
             return None
         for k, v in fields.items():
             if v is not None and hasattr(c, k):
                 setattr(c, k, v)
-        c.updated_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        c.updated_at = datetime.now(timezone.utc).isoformat(timespec="microseconds")
         self.save()
         return c
 
@@ -106,7 +129,7 @@ class Store:
         self.save()
         return True
 
-    def search(self, q: str) -> list[Customer]:
+    def search(self, q: str) -> list[OutWestSepticCustomer]:
         ql = q.lower()
         out = []
         for c in self.customers:
@@ -115,7 +138,7 @@ class Store:
                 out.append(c)
         return out
 
-    def filter(self, county: str | None = None, status: str | None = None) -> list[Customer]:
+    def filter(self, county: str | None = None, status: str | None = None) -> list[OutWestSepticCustomer]:
         out = []
         for c in self.customers:
             if county and c.county.lower() != county.lower():
@@ -126,13 +149,19 @@ class Store:
         return out
 
 
+# Backward-compatible public names refer to the same implementation classes.
+Customer = OutWestSepticCustomer
+StoreError = OutWestSepticCRMError
+Store = OutWestSepticCRMStore
+
+
 # ---------- output formatting ----------
 
-def short_id(c: Customer) -> str:
+def short_id(c: OutWestSepticCustomer) -> str:
     return c.id[:8]
 
 
-def fmt_table(rows: list[Customer]) -> str:
+def fmt_table(rows: list[OutWestSepticCustomer]) -> str:
     if not rows:
         return "(no customers)"
     headers = ["ID", "Name", "Phone", "County", "Service", "Status", "Updated"]
@@ -154,11 +183,11 @@ def fmt_table(rows: list[Customer]) -> str:
 
 # ---------- subcommands ----------
 
-def cmd_add(args, store: Store) -> int:
+def cmd_add(args, store: OutWestSepticCRMStore) -> int:
     county = args.county or ""
     if county and county not in VALID_COUNTIES:
         print(f"warning: '{county}' is not in the service territory", file=sys.stderr)
-    c = Customer(
+    c = OutWestSepticCustomer(
         id=str(uuid.uuid4()),
         name=args.name,
         phone=args.phone,
@@ -174,13 +203,13 @@ def cmd_add(args, store: Store) -> int:
     return 0
 
 
-def cmd_list(args, store: Store) -> int:
+def cmd_list(args, store: OutWestSepticCRMStore) -> int:
     rows = store.filter(county=args.county, status=args.status)
     print(fmt_table(rows))
     return 0
 
 
-def cmd_show(args, store: Store) -> int:
+def cmd_show(args, store: OutWestSepticCRMStore) -> int:
     c = store.find(args.id)
     if not c:
         print(f"no customer with id {args.id}", file=sys.stderr)
@@ -190,7 +219,7 @@ def cmd_show(args, store: Store) -> int:
     return 0
 
 
-def cmd_update(args, store: Store) -> int:
+def cmd_update(args, store: OutWestSepticCRMStore) -> int:
     fields: dict[str, Any] = {
         "name": args.name,
         "phone": args.phone,
@@ -210,7 +239,7 @@ def cmd_update(args, store: Store) -> int:
     return 0
 
 
-def cmd_delete(args, store: Store) -> int:
+def cmd_delete(args, store: OutWestSepticCRMStore) -> int:
     if not store.delete(args.id):
         print(f"no customer with id {args.id}", file=sys.stderr)
         return 1
@@ -218,13 +247,13 @@ def cmd_delete(args, store: Store) -> int:
     return 0
 
 
-def cmd_search(args, store: Store) -> int:
+def cmd_search(args, store: OutWestSepticCRMStore) -> int:
     rows = store.search(args.query)
     print(fmt_table(rows))
     return 0
 
 
-def cmd_export(args, store: Store) -> int:
+def cmd_export(args, store: OutWestSepticCRMStore) -> int:
     rows = [asdict(c) for c in store.customers]
     if args.format == "csv":
         if not rows:
@@ -243,7 +272,7 @@ def cmd_export(args, store: Store) -> int:
     return 0
 
 
-def cmd_stats(_args, store: Store) -> int:
+def cmd_stats(_args, store: OutWestSepticCRMStore) -> int:
     by_status: dict[str, int] = {}
     by_county: dict[str, int] = {}
     for c in store.customers:
@@ -310,14 +339,17 @@ def main(argv: list[str] | None = None) -> int:
     sub.add_parser("stats", help="summary stats")
 
     args = p.parse_args(argv)
-    store = Store(Path(args.store))
-
     handlers = {
         "add": cmd_add, "list": cmd_list, "show": cmd_show,
         "update": cmd_update, "delete": cmd_delete, "search": cmd_search,
         "export": cmd_export, "stats": cmd_stats,
     }
-    return handlers[args.cmd](args, store)
+    try:
+        store = OutWestSepticCRMStore(Path(args.store))
+        return handlers[args.cmd](args, store)
+    except OutWestSepticCRMError as exc:
+        print(f"CRM error: {exc}", file=sys.stderr)
+        return 2
 
 
 if __name__ == "__main__":
